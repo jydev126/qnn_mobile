@@ -1,0 +1,24 @@
+# Local Python environment and generated Python files
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+
+# Machine-specific configuration
+config/local.env
+
+# User-provided SDKs, models, inputs, and generated inference results
+external/
+artifacts/
+output/
+*.bin
+*.dlc
+*.onnx
+*.tflite
+*.pt
+*.pth
+*.safetensors
+*.raw
