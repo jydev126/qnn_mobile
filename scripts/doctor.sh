@@ -46,12 +46,22 @@ check_file() {
 
 if [[ -n "${QAIRT_ROOT:-}" ]]; then
     check_file "$QAIRT_ROOT/bin/aarch64-android/qnn-net-run"
+    check_file "$QAIRT_ROOT/bin/aarch64-android/qnn-context-binary-generator"
+    check_file "$QAIRT_ROOT/bin/aarch64-android/qnn-profile-viewer"
+    check_file "$QAIRT_ROOT/include/QNN/QnnInterface.h"
+    check_file "$QAIRT_ROOT/include/QNN/System/QnnSystemInterface.h"
     for library in libQnnHtp.so libQnnModelDlc.so libQnnHtpV79Stub.so libQnnHtpPrepare.so libQnnSystem.so; do
         check_file "$QAIRT_ROOT/lib/aarch64-android/$library"
     done
     check_file "$QAIRT_ROOT/lib/hexagon-v79/unsigned/libQnnHtpV79Skel.so"
 else
     fail 'QAIRT_ROOT 未设置；请在 config/local.env 或环境变量中填写 QAIRT 2.45.0.260326 SDK 根目录，无法检查 runtime 文件。'
+fi
+
+if [[ -n "${ANDROID_NDK_ROOT:-}" ]]; then
+    check_file "$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android${ANDROID_API:-28}-clang++"
+else
+    printf '[INFO] ANDROID_NDK_ROOT 未设置；DLC/context 工具阶段可继续，cpp-build 前需手动准备。\n'
 fi
 
 if [[ -z "${RF_DETR_DLC:-}" ]]; then

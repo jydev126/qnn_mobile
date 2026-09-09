@@ -5,7 +5,9 @@ command -v readelf >/dev/null || die '未找到 readelf。'
 export LC_ALL=C
 [[ -n "${QAIRT_ROOT:-}" ]] || die 'QAIRT_ROOT 未设置。'
 android_lib="$QAIRT_ROOT/lib/aarch64-android"
-files=("$QAIRT_ROOT/bin/aarch64-android/qnn-net-run")
+files=("$QAIRT_ROOT/bin/aarch64-android/qnn-net-run"
+       "$QAIRT_ROOT/bin/aarch64-android/qnn-context-binary-generator"
+       "$QAIRT_ROOT/bin/aarch64-android/qnn-profile-viewer")
 for name in libQnnHtp.so libQnnModelDlc.so libQnnHtpV79Stub.so libQnnHtpPrepare.so libQnnSystem.so; do
     files+=("$android_lib/$name")
 done
@@ -50,6 +52,8 @@ printf 'DSP 依赖由 DSP 环境提供；--help 不验证 DSP 加载或 HTP 推�
 
 "${ADB[@]}" shell "mkdir -p '$RUNTIME_DIR'"
 "${ADB[@]}" push "${files[@]}" "$skel" "$RUNTIME_DIR/"
-"${ADB[@]}" shell "chmod +x '$RUNTIME_DIR/qnn-net-run'"
+"${ADB[@]}" shell "chmod +x '$RUNTIME_DIR/qnn-net-run' '$RUNTIME_DIR/qnn-context-binary-generator'"
+"${ADB[@]}" shell "chmod +x '$RUNTIME_DIR/qnn-profile-viewer'"
 "${ADB[@]}" shell "LD_LIBRARY_PATH='$RUNTIME_DIR' ADSP_LIBRARY_PATH='$RUNTIME_DIR' '$RUNTIME_DIR/qnn-net-run' --help"
+"${ADB[@]}" shell "LD_LIBRARY_PATH='$RUNTIME_DIR' ADSP_LIBRARY_PATH='$RUNTIME_DIR' '$RUNTIME_DIR/qnn-context-binary-generator' --help"
 printf '\nruntime 部署完成；qnn-net-run --help 退出成功。\n'

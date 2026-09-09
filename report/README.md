@@ -2,6 +2,8 @@
 
 组会材料：[故事线、两分钟讲稿、五页汇报结构与后续实验树](group-meeting-story.md)。
 
+当前阶段：[DLC / context / C++ 实测报告](lifecycle-results.md) · [操作与原理教程](../docs/lifecycle-guide.md) · [C++ 源码导读](../cpp/README.md)。本阶段替代此前等待 PyTorch 权重的推进顺序，精度对齐仍单独标记为未完成。
+
 ## 目标
 
 用 Samsung Galaxy S25 Ultra 验证高通 HTP 部署流程，为后续 UniAD MSDeformAttn 单算子/模块实验积累可复现证据。目前实验模型是 RF-DETR small，不是完整 UniAD。
@@ -9,6 +11,8 @@
 ## 已完成
 
 QAIRT 2.45 → RF-DETR DLC → libQnnModelDlc → libQnnHtp → 手机 HTP 在线图准备及一次推理成功。输入 RGB float32 NCHW [1,3,512,512]。日志及 metadata 证实 Compose、Finalize、Execute 完成，inferences_completed=1。
+
+新增：本地手机预生成 context binary、net-run 恢复执行、自写 C++ executable 恢复执行均通过。三条路径各 6 次的原始输出逐元素相同。数据、计时口径及限制见当前阶段实测报告。
 
 ## 限制
 
@@ -40,12 +44,8 @@ QAIRT 2.45 → RF-DETR DLC → libQnnModelDlc → libQnnHtp → 手机 HTP 在�
 
 复现新增步骤：`make pull MODEL=rf_detr` → `make decode MODEL=rf_detr`。阈值可用 `SCORE_THRESHOLD=0.7 make decode MODEL=rf_detr` 调整。
 
-## 当前需要你决策
+## 暂缓的 PyTorch 对齐
 
-下一步是同图 PyTorch 对比。torch/rfdetr 已安装，但项目及常用缓存未找到 RF-DETR small 权重；现有 DLC metadata 不含 checkpoint 版本或哈希，不能保证任意下载的 small 权重与 DLC 完全一致。
+torch/rfdetr 已安装，但项目及常用缓存未找到 RF-DETR small 权重；现有 DLC metadata 不含 checkpoint 版本或哈希，不能保证任意下载的 small 权重与 DLC 完全一致。
 
-选择 A：你手动提供 RF-DETR small 权重的本地路径及来源/版本，继续 PyTorch 对比；若来源无法匹配，仅做参考对比并注明限制。
-
-选择 B：暂时跳过 PyTorch 对比，先完成手机 profiling，精度/一致性验证标记为未完成。
-
-按用户要求在此停止，不自动下载权重，不跳过决策推进性能实验。
+用户于 2026-09-09 明确改为先完成生命周期、context 和 C++ 项目。未来提供匹配权重后可恢复框架对齐；当前 runtime 三路径一致性不替代 PyTorch/mAP 验证，不自动下载权重。

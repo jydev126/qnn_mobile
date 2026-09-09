@@ -1,5 +1,21 @@
 # 任务记录
 
+## 2026-09-09：实现 QNN 生命周期工程与 C++ executable
+
+- 用户正式批准脚本 → context binary → C++ executable 与配套讲解。更新 PLAN/AGENTS，原 PyTorch 权重等待不再阻断当前阶段，精度对齐仍未完成。
+- 使用已有 Python 3.11 venv、QAIRT 2.45、本机 NDK 28.2；手机 adb 本轮正常。更新本地忽略配置的 NDK 路径，未下载依赖。
+- 新增 lifecycle 四模式、直接 NDK 编译脚本、单文件 C++ runtime、native 输出比较、设备失败检查、host 验收负例测试；扩展 Makefile 与 runtime/doctor。旧单图检测流程保留。
+- 实测 dlc.dfykEg、build-context.x2kTtq、context.tBqaMX、cpp.Qs4jXZ：context 61,456,384 bytes，三条执行路径各 6 次、54 组 tensor 检查逐元素完全一致。C++ 成功进程两次，退出 0；3 项错误输入检查退出 1。
+- 处理 native classes 文件后缀、profiling symlink 拉取、动态库卸载后的退出 SIGSEGV（使用 RTLD_NODELETE 保留映射；QNN 资源仍全部 free，SDK 内部根因未定位）。失败日志保留。
+- 新增 docs/lifecycle-guide.md、cpp/README.md、report/lifecycle-results.md，更新主入口和汇报。报告解释计时边界，不将 context 启动优势等同于稳态推理提速。
+- Bash 语法、diff、doctor、设备检查、Python 编译、NDK -Werror 构建、真实设备输出对比、3 个设备负例与3个 host 测试通过。未实现 host offline prepare/动态 shape/量化 I/O/UniAD，未做 PyTorch 对齐。
+
+## 2026-09-09：QNN 生命周期路线评估
+
+- 核对现有 run.sh、本机 QAIRT 2.45 工具文档与 SampleApp，评估用户提出的脚本 → context binary → C++ executable 路线，记录于 report/qnn-lifecycle-roadmap.md。
+- 明确预生成可在手机进行、恢复仍有初始化成本、C++ 首版仅恢复 context，以及原生 tensor dtype 与 qnn-net-run float 文件的区别。未修改运行脚本，未执行新推理或下载依赖；PLAN 尚未改写为实施计划。
+- 检查：Bash 语法与 git diff --check 通过；make doctor 因 Python 3.14.7（要求 3.11）和沙箱 adb/USB 权限失败，所检查 SDK/DLC 文件存在。
+
 ## 2026-09-09
 
 ### Git 忽略规则

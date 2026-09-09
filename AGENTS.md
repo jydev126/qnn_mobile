@@ -2,8 +2,8 @@
 
 - Host：Fedora Linux x86_64；Python：3.11 venv；手机通过 adb 访问。
 - Target：Samsung Galaxy S25 Ultra，Snapdragon 8 Elite for Galaxy / SM8750，HTP V79。
-- 唯一路线：Qualcomm AI Hub Models RF-DETR small QAIRT DLC → QAIRT 2.45.0.260326 → Samsung Galaxy S25 Ultra → `qnn-net-run` → `libQnnModelDlc.so` → `libQnnHtp.so` → HTP V79；模型路径使用 `RF_DETR_DLC`。
-- 初期仅通过 `qnn-net-run` 在手机 `/data/local/tmp` 下执行，不做 APK、CMake、JNI 或 Android Studio 工程。
+- 当前路线：Qualcomm AI Hub Models RF-DETR small QAIRT DLC → QAIRT 2.45.0.260326 → Samsung Galaxy S25 Ultra / HTP V79；先用 `qnn-net-run` + `libQnnModelDlc.so` + `libQnnHtp.so`，再由 `qnn-context-binary-generator` 预生成 context，最后以最小 C++ executable 恢复执行。模型路径使用 `RF_DETR_DLC`。
+- 用户已授权上述三阶段工程与实测；仅在手机 `/data/local/tmp` 下执行命令行程序，不做 APK、CMake、JNI 或 Android Studio 工程。
 - 外部依赖由用户手动下载。不得主动下载 QAIRT SDK、模型大文件或其他大型第三方资源；只定义路径、检查文件并报告缺失项。
 - SDK、模型文件、输入及输出数据不得提交 git，放入被忽略的 `external/`、`artifacts/`、`output/`；机器专用配置放在 `config/local.env`。
 - Bash 脚本必须开启 `set -euo pipefail`，路径须正确引用，不得硬编码用户 HOME，不得使用 sudo。

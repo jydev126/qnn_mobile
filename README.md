@@ -2,7 +2,9 @@
 
 Host 为 Fedora Linux x86_64，使用 Python 3.11 venv；Target 为 Samsung Galaxy S25 Ultra（Snapdragon 8 Elite for Galaxy / SM8750，HTP V79）。第一个模型为 Qualcomm AI Hub Models 的 **RF-DETR small**。
 
-唯一路线：
+当前学习目标是自己理解并掌握 DLC → Compose → Finalize → Context Binary → Execute，已经实现脚本和一个单文件 C++ runtime。建议先读 [从 DLC 到手机执行的教程](docs/lifecycle-guide.md)，再读 [C++ 源码导读](cpp/README.md)，实际数据见 [三条路径验证报告](report/lifecycle-results.md)。当前阶段计划见 [memory/PLAN.md](memory/PLAN.md)。
+
+基础 DLC 路线：
 
 ```text
 RF-DETR QAIRT DLC
@@ -14,14 +16,38 @@ RF-DETR QAIRT DLC
 -> HTP V79
 ```
 
-通过 adb 将 runtime 放入 `/data/local/tmp/qnn_mobile/runtime`，由 `qnn-net-run` 执行。当前实现 doctor、设备检查、最小 runtime 部署与 `--help` 验证；支持 RF-DETR small 图片输入准备，支持模型及输入部署，支持 HTP DLC online prepare 推理，不包含 APK、CMake、JNI 或 Android Studio 工程。
+通过 adb 将 runtime 放入 `/data/local/tmp/qnn_mobile/runtime`。第一段用 `qnn-net-run` 现场准备 DLC；第二段用 `qnn-context-binary-generator` 在手机预生成 binary，再由 `qnn-net-run` 恢复；第三段用自己编译的 Android C++ executable 恢复同一 binary。三条执行路径均已在 S25 Ultra 验证。不包含 APK、CMake、JNI 或 Android Studio 工程。
+
+## 当前阶段的一次完整复现
+
+配置好本地依赖、连接手机后，在仓库根目录依次执行：
+
+```bash
+source .venv/bin/activate
+make doctor
+make inspect-device
+make prepare
+make deploy-runtime
+make deploy
+make lifecycle-dlc
+make context-build
+make context-run
+make cpp-build
+make cpp-run
+make lifecycle-compare
+make cpp-check
+```
+
+默认每条执行路径重复 6 次，可用 `NUM_INFERENCES=10 make cpp-run` 修改。结果、日志和完整设备命令在 `output/lifecycle/`；失败不会覆盖已有成功记录。依赖不会自动下载，C++ 编译前在 `config/local.env` 设置 `ANDROID_NDK_ROOT`。下文保留原有检测流程说明；新生命周期输出使用 native dtype，与旧检测的默认 float 文件分开。
 
 ## 目录
 
 ```text
 config/                 配置示例；local.env 为本地私有配置
 scripts/                Bash 检查与命令入口
-models/rf_detr/          模型说明，后续添加模型专用处理逻辑
+cpp/                    单文件 C++ runtime 与源码导读
+docs/                   生命周期教程与新 DLC 接入步骤
+models/rf_detr/          模型说明、图片预处理、检测解码
 external/               用户手动提供的 QAIRT SDK 等（忽略）
 artifacts/              模型、测试图片、预处理输入等（忽略）
 output/                 手机拉回的输出（忽略）
@@ -41,7 +67,7 @@ source .venv/bin/activate
 cp config/s25u.env.example config/local.env
 ```
 
-编辑 `config/local.env`，填写 QAIRT 2.45.0.260326 SDK 根目录 `QAIRT_ROOT`、模型文件路径 `RF_DETR_DLC` 和测试图片路径 `RF_DETR_INPUT_IMAGE`。推荐使用绝对路径，不能提交该配置。也可通过环境变量传入配置；存在 `config/local.env` 时，其中赋值优先。该文件会作为 Bash 执行，只使用自己信任的配置。
+编辑 `config/local.env`，填写 QAIRT 2.45.0.260326 SDK 根目录 `QAIRT_ROOT`、模型文件路径 `RF_DETR_DLC` 和测试图片路径 `RF_DETR_INPUT_IMAGE`；C++ 阶段还要填写本地 `ANDROID_NDK_ROOT`（本次验证 NDK 28.2，Android API 28）。推荐使用绝对路径，不能提交该配置。也可通过环境变量传入配置；存在 `config/local.env` 时，其中赋值优先。该文件会作为 Bash 执行，只使用自己信任的配置。
 
 手机连接 USB，开启 USB 调试并接受授权后运行 `make doctor`。doctor 检查：
 
@@ -50,6 +76,10 @@ cp config/s25u.env.example config/local.env
 
 ```text
 bin/aarch64-android/qnn-net-run
+bin/aarch64-android/qnn-context-binary-generator
+bin/aarch64-android/qnn-profile-viewer
+include/QNN/QnnInterface.h
+include/QNN/System/QnnSystemInterface.h
 lib/aarch64-android/libQnnHtp.so
 lib/aarch64-android/libQnnModelDlc.so
 lib/aarch64-android/libQnnHtpV79Stub.so
@@ -77,7 +107,7 @@ make pull MODEL=rf_detr
 
 `inspect-device` 输出型号、board platform、hardware、Android 版本、API level 与 SELinux 状态。`inspect-device` 和 `deploy-runtime` 在 `DEVICE_SERIAL` 留空时要求恰好一台在线设备，并固定使用该序列号。
 
-`deploy-runtime` 需要主机 `readelf`，从 `QAIRT_ROOT` 检查上述 7 个文件的 ELF 架构与 DT_NEEDED，递归补充真实依赖的 Android ARM64 SDK 库，并检查设备端系统/vendor 依赖文件是否存在。只 push 选中的文件，不复制整个 SDK，不读取模型。设备目录固定为 `/data/local/tmp/qnn_mobile/runtime`。随后添加 `qnn-net-run` 执行权限，以该目录设置 `LD_LIBRARY_PATH` 和 `ADSP_LIBRARY_PATH`，实际执行 `qnn-net-run --help`；任一步失败即返回非零状态。
+`deploy-runtime` 需要主机 `readelf`，检查选中程序/库的 ELF 架构与 DT_NEEDED，递归补充真实依赖的 Android ARM64 SDK 库，并检查设备端系统/vendor 依赖文件是否存在。只 push 选中的 3 个程序和 6 个库（以及实际依赖），不复制整个 SDK，不读取模型。设备目录固定为 `/data/local/tmp/qnn_mobile/runtime`。随后设置执行权限，以该目录设置 `LD_LIBRARY_PATH` 和 `ADSP_LIBRARY_PATH`，实际执行 net-run 与 generator 的 `--help`；任一步失败即返回非零状态。
 
 `--help` 成功仅验证程序启动，不代表 backend、DLC 或 DSP 加载成功。V79 Skel 的 DSP 依赖单独报告，不用 Android 库替代；系统/vendor 文件存在也不代表其对所有动态加载场景可见。
 
