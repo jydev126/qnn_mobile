@@ -1,165 +1,539 @@
-# QNN 心智模型：从 CUDA / TensorRT 类比到 HTP
+# QNN 心智模型：用 CUDA / TensorRT 的层级重新理解 Qualcomm HTP
 
-这篇文档只回答一个问题：**QNN、QAIRT、HTP、Hexagon、Stub/Skel 分别是什么，它们在一次手机推理里各自负责什么。**
+这篇文档不是 QNN API 手册。它解决的是在开始 UniAD 之前最容易混乱的几个基础问题：**RF-DETR 在当前项目里扮演什么角色；QNN、QAIRT、HTP、Hexagon、HVX、HMX、Stub/Skel 分别在哪一层；C++ 程序到底跑在 CPU 还是 NPU；Finalize 与 TensorRT build 可以类比到什么程度。**
 
-## 1. 先给结论
-
-可以先用下面这个近似类比建立直觉：
-
-| Qualcomm/QNN 世界 | CUDA/TensorRT 世界里的近似类比 | 本质 |
-| --- | --- | --- |
-| QAIRT | CUDA Toolkit + TensorRT + 配套工具集合 | SDK/工具集合，不是硬件 |
-| QNN API | CUDA Runtime / TensorRT Runtime 这类宿主侧 API | 软件 API |
-| `libQnnHtp.so` | TensorRT/CUDA 的宿主侧 runtime/backend | CPU 进程中加载的 backend 动态库 |
-| HTP | GPU 计算设备这一层的近似位置 | Snapdragon SoC 内的 AI/DSP 计算硬件与执行环境，不是一套 Python/C++ 协议 |
-| Hexagon | Qualcomm DSP/向量处理器架构家族 | 指令集/处理器架构体系 |
-| V79 | 某一代 Hexagon/HTP 架构版本 | 目标硬件代际 |
-| Stub | host 侧跨处理器调用配套库 | ARM CPU 侧组件 |
-| Skel | DSP/HTP 侧真正被加载的配套库 | Hexagon 侧组件 |
-| DLC | TensorRT build 之前的模型资产的近似物 | 模型图、权重和相关 metadata，不是 executable |
-| QNN context binary | TensorRT serialized engine 的近似物 | 已针对 backend/目标准备后序列化的 context |
-| `qnn-net-run` | `trtexec` | Qualcomm 提供的通用命令行 runner |
-| 自己的 QNN C++ 程序 | 自己写 TensorRT runtime | 自己负责加载 context、tensor buffer 和 execute |
-
-这个表只是为了建立心智模型，不表示两套系统的文件格式、兼容规则或执行机制完全相同。
-
-## 2. HTP 到底是不是硬件
-
-把 HTP 理解成“一个软件协议”会越看越乱。对当前项目，更有用的理解是：
+当前项目固定讨论这条已经实机验证的路径：
 
 ```text
-Android ARM64 应用 / qnn-net-run
-        |
-        | 调 QNN API
-        v
-libQnnHtp.so                  <- CPU/host 侧 backend
-        |
-        | RPC / driver / runtime 协作
-        v
-V79 Stub / Skel
-        |
-        v
-HTP / Hexagon 执行资源        <- 真正跑神经网络计算的目标侧
+RF-DETR DLC
+→ QAIRT 2.45 / QNN
+→ libQnnHtp.so
+→ Snapdragon 8 Elite / SM8750 / HTP V79
+→ Samsung Galaxy S25 Ultra
 ```
 
-CPU 没有消失。进程启动、文件读取、动态库加载、QNN API 调用、tensor buffer 准备、context 恢复等仍由 ARM CPU 侧程序参与；被 HTP backend 接受的图才会在目标加速器侧执行。
+不要先把 QNN 当成“另一套 TensorRT”。先把硬件层、runtime 层、模型层分开。
 
-因此不要把“整个 Android 进程运行时间”都叫作 HTP/NPU 推理时间。
+---
 
-## 3. `libQnnHtp.so` 和 HTP 的区别
+## 1. RF-DETR 在这个项目里是什么
 
-`libQnnHtp.so` 是软件库，运行在 ARM CPU 进程中。HTP 是它面向的目标 backend/硬件执行环境。
+RF-DETR 是一个 DETR 系目标检测模型。对当前 QNN 生命周期实验，不需要先深入它内部的 Transformer 细节，只需要把它看成一个真实但边界清楚的神经网络载体：
 
-因此：
+```text
+RGB image
+[1,3,512,512] float32
+        ↓
+     RF-DETR
+        ↓
+300 个候选检测
+        ↓
+boxes   [1,300,4] float32
+scores  [1,300]   float32
+classes [1,300]   int32
+```
+
+这一步最重要的认识是：**我们当前已经解决的是“拿到一个 DLC 后怎么在 HTP 上准备和执行”，不是“RF-DETR 为什么能被转换成 DLC”。**
+
+因此 RF-DETR 是学习：
+
+```text
+DLC → Compose → Finalize → Context Binary → Execute
+```
+
+的实验载体。后面 UniAD 才会把问题推进到：
+
+```text
+PyTorch source → export-friendly graph → QNN-compatible operators → DLC
+```
+
+---
+
+## 2. 先画完整层级：不要把 HTP、QNN、HMX 混成一个词
+
+最有用的一张图是：
+
+```text
+模型层
+────────────────────────────────────────────
+RF-DETR / UniAD
+PyTorch / ONNX / DLC / QNN graph
+
+宿主软件层：ARM CPU
+────────────────────────────────────────────
+qnn-net-run / qnn-context-runner
+        │
+        ├── QNN API
+        ├── libQnnSystem.so
+        └── libQnnHtp.so          ← HTP backend 软件
+                 │
+                 │ driver / RPC / runtime 协作
+                 ▼
+
+Hexagon NPU / HTP 硬件执行侧
+────────────────────────────────────────────
+        Scalar / control resources
+        HVX  vector/SIMD resources
+        HMX  matrix/tensor resources
+        local/shared/on-chip memory
+                 │
+                 ▼
+
+SoC memory system
+────────────────────────────────────────────
+System LPDDR + cache / local memory hierarchy
+```
+
+这里有三个必须分开的对象：
+
+```text
+QNN             软件 API / runtime 体系
+libQnnHtp.so    ARM CPU 进程加载的 HTP backend 动态库
+HTP/Hexagon NPU 芯片上的 AI 加速执行目标
+```
+
+所以：
 
 ```text
 libQnnHtp.so != HTP
+QNN != HTP
+HMX != HTP
 ```
 
-更像：
+---
+
+## 3. HTP 到底是 CPU、GPU、DSP 还是 NPU
+
+先给项目里最实用的结论：
+
+> **对于 AI 部署，把 HTP / Hexagon 这一侧理解成 Qualcomm NPU 最合适。它不是 GPU，也不是 ARM CPU。**
+
+术语之所以容易乱，是因为 Hexagon 从传统 DSP 架构长期演进到今天的 AI/NPU 架构，Qualcomm 的资料中会同时看到：
 
 ```text
-CUDA runtime / TensorRT runtime != NVIDIA GPU
+Hexagon DSP
+Hexagon NPU
+HTP = Hexagon Tensor Processor
+HVX = Hexagon Vector eXtensions
+HMX = Hexagon Matrix eXtensions
 ```
 
-项目中 `LD_LIBRARY_PATH` 用来让 Android 进程找到 ARM64 动态库；`ADSP_LIBRARY_PATH` 用来让 DSP/HTP 侧找到对应 Hexagon 库。两侧 ABI/架构不同，不能互换。
+现代 Qualcomm 对 Hexagon NPU 的描述强调的是 scalar、vector、tensor accelerator 的融合。公开 SoC 资料也能看到 HTP 与 Hexagon DSP、HVX、HMX 协同出现。
 
-## 4. Stub / Skel 是什么
-
-可以先把它们看成“CPU 与 Hexagon 两边一对配套组件”。
+因此不要做两个错误等式：
 
 ```text
-ARM CPU                          Hexagon / HTP
-   |                                  |
-V79 Stub  <------ 跨处理器调用 ----> V79 Skel
+DSP = HTP           ×
+HTP = Tensor Core   ×
 ```
 
-Stub 是 ARM64 侧，Skel 是 Hexagon 侧。项目当前目标是 Snapdragon 8 Elite / SM8750 / HTP V79，所以部署的是 V79 对应组件。
+更好的层级理解是：
 
-这也是为什么不能只 push 一个 `libQnnHtp.so` 就认为 HTP runtime 已完整部署。
+```text
+Hexagon NPU / HTP execution subsystem
+        │
+        ├── scalar/control 类资源
+        ├── HVX：宽向量/SIMD
+        └── HMX：矩阵/tensor acceleration
+```
 
-## 5. Compose / Finalize / Execute 应该放在什么位置理解
+不同 SoC 代际的具体组织方式会变化，所以这张图是“职责层级”，不是 SM 框图的精确一一映射。
 
-一个 DLC 真正被执行前，不是“把文件扔给 NPU”这么简单。
+参考：Qualcomm Hexagon NPU 官方介绍与 Qualcomm 公开 SoC data sheet。
+
+---
+
+## 4. 和 NVIDIA 怎么对齐才不容易错
+
+### NVIDIA 心智模型
+
+```text
+TensorRT / CUDA runtime
+        ↓
+NVIDIA GPU
+        ↓
+SM
+ ├── 普通 FP/INT/SIMD execution
+ └── Tensor Core
+```
+
+### Qualcomm 心智模型
+
+```text
+QNN runtime / libQnnHtp.so
+        ↓
+Hexagon NPU / HTP
+ ├── scalar/control
+ ├── HVX vector
+ └── HMX matrix/tensor
+```
+
+近似类比：
+
+| NVIDIA / TensorRT | Qualcomm / QNN | 应该怎么理解 |
+| --- | --- | --- |
+| TensorRT / CUDA host runtime | QNN + HTP backend | host 侧软件栈，非硬件 |
+| NVIDIA GPU device | Hexagon NPU / HTP 执行侧 | 整体 AI accelerator 层级的近似位置 |
+| Tensor Core | HMX | 都承担矩阵/tensor-heavy 加速角色，但 ISA/架构不同 |
+| SIMD/普通 execution resources | HVX + scalar 等 | 只能做职责类比，不能换算“几个 CUDA Core” |
+| `trtexec` | `qnn-net-run` | 通用命令行 runner |
+| 自写 TRT runtime | `qnn-context-runner` | 自己管理 runtime 生命周期和 I/O |
+| serialized TRT engine | QNN context binary | 都是已准备执行资产的近似类比 |
+
+特别记住：
+
+> **HMX ≈ Tensor Core 的“角色”；HTP 不是 Tensor Core。**
+
+也不要追问“一个 HTP 等于几个 SM”。两个架构的执行模型和公开抽象层级并不支持这种换算。
+
+---
+
+## 5. QNN 是不是只能跑 HTP
+
+不是。
+
+QNN 是一套 backend 化的推理 API/runtime 体系。不同 SDK/设备可以提供不同 backend；常见理解包括 CPU、GPU、HTP 等执行目标。**当前项目明确选的是 HTP，因为命令里写了：**
+
+```bash
+--backend /data/local/tmp/qnn_mobile/runtime/libQnnHtp.so
+```
+
+所以当前实验的含义不是：
+
+```text
+QNN = NPU
+```
+
+而是：
+
+```text
+QNN graph/runtime
+        +
+选择 HTP backend
+        ↓
+Hexagon NPU/HTP 执行
+```
+
+类似：
+
+```text
+PyTorch API
+ ├── CPU
+ ├── CUDA
+ └── MPS
+```
+
+但不能反过来说“CUDA 可以跑 CPU/GPU/NPU”。CUDA 本身就是 NVIDIA GPU 软件栈；同理 `libQnnHtp.so` 就是在选 HTP 路径。
+
+---
+
+## 6. 当前 RF-DETR 到底哪里跑在 CPU，哪里跑在 HTP
+
+“RF-DETR 跑在 NPU 上”可以说。
+
+“整个 C++ 程序跑在 NPU 上”不对。
+
+当前 `qnn-context-runner` 是一个 Android ARM64 executable，它首先运行在 CPU：
+
+```text
+ARM CPU
+────────────────────────────────────────
+qnn-context-runner
+    │
+    ├── dlopen(libQnnHtp.so)
+    ├── dlopen(libQnnSystem.so)
+    ├── 读 rf_detr.bin
+    ├── backendCreate / deviceCreate
+    ├── contextCreateFromBinary
+    ├── graphRetrieve
+    ├── 分配 input/output std::vector
+    └── graphExecute(...)
+                │
+                │ QNN backend / RPC / driver
+                ▼
+
+Hexagon NPU / HTP
+────────────────────────────────────────
+已 finalize/restore 的 RF-DETR graph
+Conv / MatMul / attention / elementwise / ...
+由 backend 的执行计划映射到目标硬件资源
+                │
+                ▼
+
+ARM CPU
+────────────────────────────────────────
+graphExecute 返回
+    ├── 读取 output client buffer
+    └── 写 boxes.raw / logits.raw / classes.raw
+```
+
+所以以后说性能时必须问：
+
+```text
+进程总时间？
+context restore？
+QnnGraph_execute CPU wall time？
+还是 accelerator profiling time？
+```
+
+项目 C++ 源码已经在计时代码旁明确写了：`graphExecute` 那段是 **CPU 侧同步 API wall time，包含 RPC 等，不等于 HTP 内部 kernel 时间**。
+
+---
+
+## 7. `libQnnHtp.so` 为什么看起来像“HTP 本身”
+
+因为 backend 名字里也有 HTP。
+
+但两层完全不同：
+
+```text
+HTP hardware
+    ↑ 被驱动
+libQnnHtp.so
+    ↑ 被加载
+ARM C++ process
+```
+
+可以粗略类比：
+
+```text
+NVIDIA GPU               Qualcomm HTP/NPU
+CUDA/TensorRT runtime     QNN HTP backend
+host C++ app              qnn-context-runner
+```
+
+`libQnnHtp.so` 的职责包括向 QNN 提供 HTP backend API，并协调目标侧 runtime。具体每个算子最后如何分配到 HMX/HVX/scalar、怎样做 tiling/fusion/memory scheduling，不是当前 C++ runner 逐算子控制的。
+
+你的代码里不会写：
+
+```cpp
+run_on_hmx(node_a);
+run_on_hvx(node_b);
+```
+
+就像正常 TensorRT runtime 里也不会为每层手工指定某个 Tensor Core。
+
+---
+
+## 8. Stub / Skel 为什么存在
+
+当前 Android CPU 和 Hexagon 侧是不同执行环境，需要跨处理器的软件配套。
+
+项目部署：
+
+```text
+ARM64 side                       Hexagon V79 side
+──────────────────               ──────────────────
+libQnnHtpV79Stub.so   <------>   libQnnHtpV79Skel.so
+```
+
+你可以把它们先理解成跨 CPU ↔ Hexagon 调用链两边的配套组件：
+
+- Stub 是 ARM 侧；
+- Skel 是 Hexagon 侧；
+- 两边架构不同，不能互换；
+- `LD_LIBRARY_PATH` 主要影响 CPU 侧动态库查找；
+- `ADSP_LIBRARY_PATH` 为 Hexagon/DSP 侧库查找提供路径。
+
+这也解释了为什么只 push `libQnnHtp.so` 并不代表完整 HTP runtime 已经部署好。
+
+---
+
+## 9. Compose / Finalize / Execute：和 TensorRT 最值得建立的类比
+
+### TensorRT
+
+你熟悉的是：
+
+```text
+network / ONNX
+   ↓
+builder
+   ↓
+tactic / kernel / memory planning / optimization
+   ↓
+engine
+   ↓
+execute
+```
+
+### 当前 QNN DLC 路线
 
 ```text
 DLC
- |
- | loader 读取模型
- v
+ ↓
+libQnnModelDlc.so 读取
+ ↓
 Compose
- |  创建 graph / tensor / node 并连接
- v
-Finalize
- |  backend 对图做目标相关准备
- v
-Executable graph
- |
- v
-Execute x N
+    创建 graph/tensor/node/connectivity
+ ↓
+QnnGraph_finalize()
+    HTP backend 做目标相关 prepare / optimization
+ ↓
+Execute
 ```
 
-Compose 是流程，不是一个通用 `QnnGraph_compose()` API。模型 loader 会调用一系列 QNN graph/tensor/node API 把模型组织出来。
+这里最重要的是：
 
-Finalize 才是非常重要的 API 边界。对 HTP backend，它会触发目标相关的图准备、验证与优化。Finalize 成功后图才进入可执行状态。
+- Compose 是一段流程，不存在一个通用 `QnnGraph_compose()`；
+- `QnnGraph_finalize()` 才是明确 API 边界；
+- Finalize 之后的图才能用于 Execute；
+- backend 负责把逻辑 graph 变成适合目标 HTP 的执行状态。
 
-## 6. Context Binary 是什么
+所以可以用 TensorRT builder 建立直觉，但不要假设 Finalize 内部就是 TRT builder 的同构实现。
 
-Finalize 后的 context 可以序列化：
+---
+
+## 10. Context Binary 为什么像 TensorRT engine，但又不完全一样
+
+当前项目的两条路径：
+
+### DLC online prepare
 
 ```text
 DLC
- -> Compose
- -> Finalize
- -> serialize context
- -> model.bin
+→ Compose
+→ Finalize
+→ Execute × N
 ```
 
-以后新进程可以直接：
+### Context Binary
+
+build 阶段：
 
 ```text
-model.bin
- -> contextCreateFromBinary
- -> graphRetrieve
- -> Execute
+DLC
+→ Compose
+→ Finalize
+→ serialize context
+→ rf_detr.bin
 ```
 
-因此 context binary 的价值主要是：**把 Compose/Finalize 从每次应用启动路径中移走。**
-
-它仍然：
-
-- 不是 Android executable；
-- 需要兼容的 QNN/HTP runtime；
-- 受 SDK、SoC、HTP 架构等兼容条件约束；
-- 恢复 context 本身仍有成本；
-- 不等于稳态单次 Execute 一定更快。
-
-## 7. 当前项目里一次推理到底是谁在干什么
-
-以当前 RF-DETR context 路径为例：
+运行阶段：
 
 ```text
-qnn-context-runner                         ARM CPU executable
-    |
-    | dlopen / QNN API
-    v
-libQnnSystem.so + libQnnHtp.so             ARM CPU libraries
-    |
-    | 恢复 context / graph metadata
-    | 准备输入输出 buffer
-    | graphExecute()
-    v
-HTP V79                                     加速器侧执行图
-    |
-    v
-output buffers
-    |
-    v
-ARM CPU 程序写 raw 文件 / 后处理
+rf_detr.bin
+→ contextCreateFromBinary
+→ graphRetrieve
+→ Execute × N
 ```
 
-所以日后看任何性能数据，都先问一句：
+Qualcomm AI Hub 文档把 DLC 描述为更 SoC-agnostic 的模型表示，把 Context Binary 描述为面向特定 HTP/SoC prepare 后的表示。
 
-> 这个时间是整个进程 wall time、QNN API 时间、Finalize 时间，还是 accelerator execute 时间？
+因此最实用的类比仍然是：
 
-这比先纠结“它到底叫 DSP、NPU 还是 HTP”更重要。
+```text
+DLC                 ~ build 前模型资产
+Context Binary      ~ serialized engine
+```
+
+但不要由这个类比推出：
+
+```text
+.bin 是 executable                 ×
+.bin 跨所有 SoC/SDK 都兼容          ×
+恢复 .bin 就没有初始化成本           ×
+.bin 一定让 steady Execute 更快      ×
+```
+
+当前实测正好证明最后一点不成立：DLC、context + net-run、context + C++ 的 steady Execute 都在同一量级；context 的收益主要是把约 10 秒级 Finalize 从运行阶段移走。
+
+---
+
+## 11. 一张最终的 NVIDIA ↔ Qualcomm 层级图
+
+```text
+NVIDIA                                      Qualcomm
+────────────────────────────────────────────────────────────
+model / ONNX                                model / DLC
+       │                                           │
+TensorRT builder/runtime                         QNN
+       │                                           │
+CUDA runtime/driver                       libQnnHtp.so
+       │                                           │
+NVIDIA GPU                               Hexagon NPU / HTP
+       │                                  │       │       │
+       │                                scalar    HVX     HMX
+       │                                         vector  matrix/tensor
+       │
+SM / execution resources
+       │
+CUDA / Tensor Core
+```
+
+这不是 1:1 架构图，而是层级图。
+
+只允许记三句话时，记：
+
+```text
+HTP / Hexagon NPU = AI accelerator 执行硬件这一层
+HMX               = 最接近 Tensor Core 角色的 matrix/tensor 单元
+libQnnHtp.so      = ARM CPU 侧驱动/使用 HTP 的 QNN backend 软件
+```
+
+---
+
+## 12. 对后续 UniAD 最直接的意义
+
+UniAD 迁移时你不会自己指定：
+
+```text
+这个 MSDeformableAttention MatMul 去 HMX
+这个 sampling 去 HVX
+```
+
+你真正控制的是更高一层：
+
+```text
+PyTorch graph 怎么改写
+shape/layout 是否静态
+用哪些 QNN 可接受的 primitives
+哪些内容留在 DLC 内
+哪些后处理留 CPU
+```
+
+然后：
+
+```text
+export / converter
+→ QNN graph
+→ Finalize / Hexagon compiler/backend optimization
+→ HTP execution plan
+```
+
+所以“研究算子支持”的目标不是学习 HMX 指令，而是**把 UniAD 表达成 QNN/HTP backend 能高质量 lower 的 graph。**
+
+---
+
+## 13. 本项目里已经证明与尚未证明的边界
+
+已经证明：
+
+```text
+[✓] ARM64 C++ 能加载 libQnnHtp.so / libQnnSystem.so
+[✓] V79 Stub/Skel 配套能在 S25 Ultra 工作
+[✓] RF-DETR DLC 可 Compose + Finalize + Execute
+[✓] context binary 可恢复并 Execute
+[✓] 自写 C++ 的 I/O 与 qnn-net-run 输出完全一致
+```
+
+尚未由当前项目证明：
+
+```text
+[ ] 某个具体 node 到底落在 HMX 还是 HVX
+[ ] RAW client buffer 是否零拷贝给 HTP
+[ ] HTP 内部 activation 的具体物理地址/tiling
+[ ] UniAD 的特殊算子已经能被 HTP 接收
+```
+
+这四类问题不要从“模型成功运行”反推答案。
+
+---
+
+## 参考入口
+
+- Qualcomm Hexagon NPU: https://www.qualcomm.com/processors/hexagon
+- Qualcomm AI Hub FAQ（DLC / Context Binary 与 Hexagon NPU）: https://dev.aihub.qualcomm.com/docs/hub/faq.html
+- Qualcomm 公开 SoC Data Sheet 可用于理解 HTP/HVX/HMX 的硬件层级，但不同 SoC 的具体单元数量和 memory 规格不能直接套到 SM8750。
+- 本项目源码：`cpp/qnn_context_runner.cpp`
+- 本项目实测：`report/lifecycle-results.md`
