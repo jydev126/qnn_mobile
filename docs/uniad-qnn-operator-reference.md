@@ -1,33 +1,54 @@
-# UniAD → QNN DLC 算子参考地图
+# UniAD → QNN DLC：逐模块对照 Qualcomm 已有实现
 
-这篇文档不是在宣称“UniAD 已经可以直接导出 QNN DLC”。它回答的是：**UniAD stage2_e2e 里哪些模块/算子已经有 Qualcomm AI Hub Models 的近似成功案例可以参考，哪些需要扩展，哪些应该先放在 QNN 图外。**
+这篇文档只做一件事：**把 UniAD stage2_e2e 的高风险模块逐个对到 Qualcomm `ai-hub-models` 里已经存在的源码实现，并明确“能直接参考什么、还缺什么、下一步应该写哪个 standalone 实验”。**
 
-参考对象：
+不是“QNN 支持表”，也不宣称 UniAD 已经可以直接导出 DLC。
 
-- OpenDriveLab UniAD `projects/configs/stage2_e2e/base_e2e.py`
-- UniAD `spatial_cross_attention.py` / `temporal_self_attention.py`
-- Qualcomm AI Hub Models 的 BEVFormer QNN 适配 patch
-- Qualcomm AI Hub Models 的 RF-DETR export/QNN 路径
+当前最重要的结论已经从“BEVFormer 有点像 UniAD”推进到更具体的四条：
 
-## 1. 先看 UniAD stage2 的关键静态参数
+```text
+1. UniAD TSA (num_levels=1)
+   → Qualcomm BEVFormer TSA optimized 是最直接参考。
 
-主配置中：
+2. UniAD SCA core (num_levels=4)
+   → Qualcomm BEVFormer 负责 SCA/3D-reference/layout 参考；
+   → Qualcomm Mask2Former/RF-DETR 负责真正 multi-level sampling core 参考。
+
+3. UniAD backbone DCNv2
+   → Qualcomm CenterNet template 已经有 custom_deformconv2d decomposition，
+      不再是“完全没有 Qualcomm 参考”。
+
+4. Planning collision optimizer
+   → 明确留 CPU，不把 nonzero/Numpy/nonlinear solver 强塞进第一版 DLC。
+```
+
+---
+
+# 1. UniAD stage2 先固定这些结构事实
+
+当前 stage2_e2e 需要关注：
 
 ```text
 embed_dims = 256
-feature levels = 4
 BEV = 200 x 200
 num_query = 900
+feature levels = 4
 ```
 
 BEV encoder：
 
 ```text
-TemporalSelfAttention:
+TemporalSelfAttention
     num_levels = 1
+    num_heads = 8
+    num_points = 4
+    num_bev_queue = 2
 
-SpatialCrossAttention -> MSDeformableAttention3D:
+SpatialCrossAttention
+    ↓
+MSDeformableAttention3D
     num_levels = 4
+    num_heads = 8
     num_points = 8
 ```
 
@@ -35,224 +56,555 @@ Detection decoder：
 
 ```text
 MultiheadAttention
-CustomMSDeformableAttention:
++
+CustomMSDeformableAttention
     num_levels = 1
 ```
 
-Segmentation head：
+其它：
 
 ```text
-MultiScaleDeformableAttention:
-    num_levels = 4
-```
+Panseg / segmentation:
+    4-level deformable attention
 
-Motion head：
-
-```text
-MotionDeformableAttention:
+Motion:
+    MotionDeformableAttention
     num_levels = 1
     num_heads = 8
     num_points = 4
     num_steps = 12
+
+Backbone:
+    ResNet101
+    stage 3/4 使用 DCNv2
 ```
 
-所以不要把“UniAD 的 deformable attention”当成一个算子；至少有 4 种不同使用场景。
+因此“UniAD 的 deformable attention”不是一个问题，而至少是：
 
-## 2. 总体优先级
+```text
+TSA single-level
+SCA 4-level
+Detection decoder single-level
+Segmentation 4-level
+Motion single-level + temporal steps
+```
 
-| UniAD 模块/算子 | 风险 | Qualcomm 可参考实现 | 结论 |
+---
+
+# 2. 先给最终参考表
+
+| UniAD 模块 | Qualcomm 源码参考 | 参考强度 | 还缺什么 |
 | --- | --- | --- | --- |
-| ResNet 普通 Conv/BN/ReLU | 低 | 大量 AI Hub 模型 | 先保留 |
-| DCNv2 backbone | 高 | Qualcomm BEVFormer 为部署改成普通 ResNet50 路径，没有直接沿用 UniAD DCNv2 | 单独处理，不能跳过 |
-| FPN | 低~中 | Qualcomm BEVFormer | 优先原样 export 验证 |
-| TemporalSelfAttention, level=1 | 中 | `MSDeformableAttention_TSA_Optimized` | **最接近直接参考** |
-| SpatialCrossAttention 上层 rebatch/scatter | 高 | Qualcomm BEVFormer SCA patch | **强参考，但需适配 UniAD 200x200** |
-| MSDeformableAttention3D, level=4 | 高 | Qualcomm `MSDeformableAttention3D_SCA_Optimized` 只验证 level=1 | 核心数学可复用，必须补 multi-level |
-| Decoder MultiheadAttention | 中 | `MultiheadAttention_Optimized` | 可参考 1x1 Conv/layout 改写 |
-| Decoder CustomMSDeformableAttention, level=1 | 中 | `CustomMSDeformableAttention_Decoder_Optimized` | **很接近直接参考** |
-| Seg head MultiScaleDeformableAttention, level=4 | 高 | RF-DETR multi-level PyTorch core + QNN recipe | 用 RF-DETR 参考比 BEVFormer 更合适 |
-| MotionDeformableAttention, level=1 | 中~高 | Qualcomm single-level deformable sampling core | 核心 sampling 可复用，外层 `num_steps` 需重写 |
-| Standard MHA / FFN / LayerNorm | 中 | Qualcomm BEVFormer optimized MHA/Linear | 优先标准化/静态化 |
-| BEV rotate/warp | 中 | Qualcomm `custom_rotate` + `grid_sample` | 可直接借鉴表达方式 |
-| ScatterND | 高 | Qualcomm `custom_utils.ScatterND` | 可参考，但需验证索引 contract |
-| 动态 `nonzero` / 变长 query | 很高 | Qualcomm SCA static padding/top-k/mask 思路 | 必须静态化 |
-| Planning collision optimizer | 图外 | 无需硬塞 QNN | **保留 CPU 后处理** |
+| DCNv2 | `templates/centernet/model_patches.py::custom_deformconv2d` | **强** | 对齐 UniAD/mmcv DCNv2 参数与 batch/groups |
+| GridSample | BEVFormer / Mask2Former / RF-DETR / CREStereo / SimpleBEV | **很强** | 固定 coordinate/mode/align_corners 语义 |
+| TSA | BEVFormer `MSDeformableAttention_TSA_Optimized` | **很强** | UniAD 权重映射 + 200×200 性能/内存 |
+| SCA 上层 | BEVFormer `SpatialCrossAttention` Qualcomm patch | **很强** | UniAD camera rebatch/nonzero 静态化 |
+| SCA 3D MSDA | BEVFormer `MSDeformableAttention3D_SCA_Optimized` | **接口强 / core 不完整** | Qualcomm helper 只按 single-level 优化 |
+| 4-level MSDA core | Mask2Former `multi_scale_deformable_attention` + RF-DETR core | **很强** | 与 UniAD 3D reference layout 拼接 |
+| Decoder MSDA | BEVFormer `CustomMSDeformableAttention_Decoder_Optimized` | **很强** | 权重/shape 对齐 |
+| MHA | BEVFormer `MultiheadAttention_Optimized` | **强** | 是否值得 split-head / layout 改写要 profile |
+| Linear/FFN layout | BEVFormer `OptimizedLinear` | **强** | 只针对规则 spatial tensor 试，不全局替换 |
+| ScatterND | BEVFormer `custom_utils.ScatterND`、BEVDet | **中~强** | 动态 index / duplicate semantics |
+| NonZero/变长 query | BEVFormer static padding/mask；StateTransformer dynamic-control rewrite | **思想强** | UniAD 需要自己定 fixed max contract |
+| BEV rotate | BEVFormer `custom_rotate` / GridSample | **强** | center/angle/layout 对齐 |
+| Planning nonlinear optimizer | 无需 QNN 参考 | **明确图外** | CPU 后处理接口 |
 
-## 3. Backbone：先处理 DCNv2 这个现实问题
+---
 
-UniAD stage2 使用 ResNet101，并在后两 stage 打开 DCNv2：
+# 3. Backbone DCNv2：现在有一个具体 Qualcomm 解法可抄
+
+上一版只说：
 
 ```text
-stage_with_dcn = (False, False, True, True)
+UniAD 有 DCNv2
+Qualcomm BEVFormer 改成普通 ResNet50
+所以 DCNv2 高风险
 ```
 
-Qualcomm BEVFormer QNN 适配选择的是更简单的 ResNet50/普通卷积配置，而不是证明原版 BEVFormer/UniAD 的 DCNv2 可以原样进入 QNN。
+这不够。
 
-因此第一轮完整 DLC 实验不能假设 backbone 已解决。建议两个方向并行：
+Qualcomm `ai-hub-models` 里还有更直接的参考：
 
 ```text
-A. 给 DCNv2 做最小 export/QNN 测试
-B. 准备无 DCN 的部署 backbone 版本，做权重/精度迁移实验
+src/qai_hub_models/models/templates/centernet/model_patches.py
 ```
 
-如果目标是先打通 UniAD 主干链路，B 往往更可控。
-
-## 4. TemporalSelfAttention：第一优先级实验
-
-UniAD 配置中 TSA 是：
+里面明确提供：
 
 ```text
-num_levels = 1
-num_bev_queue = 2
-num_points = 4
+calculate_p0()
+calculate_pk()
+bilinear_sample()
+custom_deformconv2d()
+custom_dcn_forward()
+```
+
+## 3.1 Qualcomm 实际把 DCNv2 展成什么
+
+原本：
+
+```text
+DCNv2 compiled/custom operator
+```
+
+改成：
+
+```text
+input x
+  │
+  ├── conv_offset_mask(x)
+  │      ├── learned offset y
+  │      ├── learned offset x
+  │      └── sigmoid modulation mask
+  │
+  ├── regular conv base grid p0
+  ├── kernel relative grid pk
+  │
+  └── p = p0 + pk + learned_offset
+              │
+              ▼
+        bilinear_sample(x, p)
+              │
+              ▼
+        * modulation mask
+              │
+              ▼
+        reshape sampled patch
+              │
+              ▼
+          F.conv2d
+```
+
+这就是 DCNv2 的 deploy-friendly decomposition。
+
+## 3.2 对 UniAD 不能直接 copy 后就结束
+
+必须逐项核对 UniAD 使用的 DCN：
+
+```text
+kernel_size
+stride
+padding
+dilation
+groups
+deformable_groups
+modulated=True/False
+offset/mask channel ordering
+batch size
+weight layout
+boundary behavior
+```
+
+Qualcomm CenterNet 实现里存在针对其模型 contract 的假设，所以第一件事不是直接替换 UniAD ResNet，而是：
+
+```text
+Experiment DCN-01
+
+Original UniAD/mmcv DCNv2
+        vs
+Qualcomm-style custom_deformconv2d
+```
+
+固定一层真实 UniAD weight + feature input，先做 PyTorch 数值对齐。
+
+## 3.3 证据等级
+
+Qualcomm 当前 CenterNet Pose recipe 有 QNN Context Binary 路线，这说明这种 DCN decomposition 是 Qualcomm 实际用于 NPU/export 的代码路径。
+
+但这不等于：
+
+```text
+UniAD 的所有 DCNv2 参数组合
+→ QNN_DLC 原样 PASS
+```
+
+所以结论应写：
+
+> **DCNv2 已找到 Qualcomm 官方 decomposition 参考；UniAD 仍需 standalone 验证。**
+
+---
+
+# 4. TemporalSelfAttention：最应该第一个真正导 DLC 的 UniAD attention
+
+UniAD TSA：
+
+```text
 embed_dims = 256
 num_heads = 8
+num_levels = 1
+num_points = 4
+num_bev_queue = 2
 ```
 
-这与 Qualcomm BEVFormer patch 中的：
+Qualcomm BEVFormer patch：
 
 ```text
 MSDeformableAttention_TSA_Optimized
 ```
 
-非常接近。
+参数结构几乎就是这个场景。
 
-Qualcomm 的改写思想：
-
-```text
-query/current+history BEV
-→ sampling_offsets / attention_weights
-→ reference_points + normalized offset
-→ grid_sample
-→ weighted sum
-```
-
-并把规则 BEV tensor 组织成 NCHW/NHWC，空间 Linear 可替换为 1x1 Conv。
-
-### 这里要注意
-
-Qualcomm BEVFormer-Tiny 实验 BEV 更小，UniAD 是 200x200；“算子能表达”不等于 40k BEV queries 的性能/内存一定可接受。
-
-所以 TSA 应先做独立 DLC benchmark：
+## 4.1 Qualcomm 改写后的核心路径
 
 ```text
-[1,200,200,256] query
-+ prev_bev
-+ reference_points
-→ TSA
+current query + history/prev_bev
+        │
+        ├── sampling_offsets projection
+        └── attention_weights projection + softmax
+
+reference_points
+        +
+normalized offsets
+        ↓
+sampling_locations
+        ↓
+F.grid_sample(value)
+        ↓
+* attention_weights
+        ↓
+weighted sum
 ```
 
-同时记录 QNN graph memory 和 Execute 时间。
-
-## 5. SpatialCrossAttention 上层：比 deformable core 更危险
-
-UniAD 原始 SCA 在每个 camera 上：
+另外 Qualcomm 会控制：
 
 ```text
-bev_mask
-→ sum/nonzero
-→ 得到每个 camera 的有效 query index
-→ max(variable lengths)
-→ 创建 max_len buffer
-→ Python loop rebatch
-→ deformable attention
-→ 再按 index scatter/add 回 slots
-→ camera count normalize
+NCHW/NHWC layout
+OptimizedLinear = Conv2d(k=1)
+split-head / reshape pattern
 ```
 
-这段的风险是：**动态 query 数 + `nonzero` + Python loop + scatter**，不只是 deformable attention 本身。
+## 4.2 我们要做的不是重新写 TSA，而是先验证“权重能否映射”
 
-Qualcomm BEVFormer patch 正好值得参考这里。它引入了：
+第一版 standalone contract 建议直接固定：
+
+```text
+query/current_bev     [1,200,200,256] 或 deployment layout
+prev_bev              fixed shape
+reference_points      fixed shape
+spatial_shapes        [(200,200)] / static constants
+num_levels            1
+num_points            4
+```
+
+验收：
+
+```text
+Original UniAD TSA
+vs
+Qualcomm-style TSA
+```
+
+对齐：
+
+```text
+sampling_offsets.weight/bias
+attention_weights.weight/bias
+value layout
+reference coordinate convention
+head merge order
+```
+
+然后立即：
+
+```text
+export → QNN float DLC → S25 HTP
+```
+
+而不是先拼整个 encoder。
+
+## 4.3 性能为什么必须单独测
+
+UniAD BEV：
+
+```text
+200 × 200 = 40,000 queries
+```
+
+一个 `[1,200,200,256] float32` tensor payload 约 39 MiB。
+
+所以：
+
+```text
+“Qualcomm 小 BEV 模型能表达 TSA”
+```
+
+不代表：
+
+```text
+“UniAD 40k queries 的 latency/memory 一定合理”
+```
+
+TSA 必须单独 profile。
+
+---
+
+# 5. SpatialCrossAttention：真正难点有两层，不要混在一起
+
+UniAD SCA：
+
+```text
+Layer A: camera-visible query rebatch / mask / scatter
+Layer B: MSDeformableAttention3D sampling core
+```
+
+如果一次全改，出了错完全不知道是：
+
+```text
+nonzero 动态 shape？
+rebatch index？
+reference point？
+grid_sample？
+attention weight？
+scatter？
+```
+
+所以必须拆开。
+
+---
+
+# 6. SCA Layer A：camera rebatch / mask / ScatterND
+
+原始 BEVFormer/UniAD 类逻辑可以抽象成：
+
+```text
+bev_mask per camera
+        ↓
+找 visible queries
+        ↓
+每个 camera query 数不同
+        ↓
+rebatch 成 camera-specific query list
+        ↓
+attention
+        ↓
+scatter/add 回完整 BEV slots
+        ↓
+按可见 camera 数 normalize
+```
+
+最危险的是：
+
+```text
+nonzero
+variable length
+max(dynamic lengths)
+Python loop
+scatter dynamic indices
+```
+
+## 6.1 Qualcomm BEVFormer patch 真正值得抄的是“静态化思想”
+
+重点变量：
 
 ```text
 padded_query_len(...)
 sca_use_topk_query_pruning
 sca_masking_before_gridsample
 ScatterND
-固定/受控的 query canvas
 ```
 
-目标是把“不定长 camera query list”改成更静态的 tensor graph。
-
-因此 UniAD SCA 推荐先分成两个子问题：
+目标不是保留原来的 variable list，而是趋向：
 
 ```text
-A. camera rebatch/scatter 静态化
-B. MSDeformableAttention3D core
+fixed max_len
++
+padding
++
+validity mask
++
+fixed canvas
 ```
 
-不要一次同时改。
-
-## 6. MSDeformableAttention3D：Qualcomm 有参考，但不是直接替换
-
-UniAD 原版 SCA core：
+也就是：
 
 ```text
+动态 shape
+→ 静态 shape + data mask
+```
+
+## 6.2 UniAD 第一版建议明确 contract
+
+例如先选择一个固定：
+
+```text
+MAX_VISIBLE_QUERIES_PER_CAMERA = K
+num_cams = 6
+```
+
+每个 camera 永远输出：
+
+```text
+[K, C]
+```
+
+无效位置靠：
+
+```text
+valid mask
+```
+
+处理，而不是 tensor length 变化。
+
+K 具体怎么定，要从真实 nuScenes sample 统计，不应该随便拍脑袋。
+
+---
+
+# 7. SCA Layer B：UniAD 是 4-level，Qualcomm BEVFormer helper 不是
+
+UniAD：
+
+```text
+MSDeformableAttention3D
 num_levels = 4
 num_points = 8
 ```
 
-它生成：
-
-```text
-sampling_offsets:
-[B,Q,heads,levels,points,2]
-
-attention_weights:
-[B,Q,heads,levels,points]
-```
-
-然后原代码调用 MMCV/CUDA `MultiScaleDeformableAttnFunction`。
-
-Qualcomm 的：
+Qualcomm BEVFormer：
 
 ```text
 MSDeformableAttention3D_SCA_Optimized
 ```
 
-把 CUDA extension 改成了 `grid_sample + weighted sum`，但其公开 BEVFormer-Tiny QNN 配置只有：
+非常有价值，因为它已经解决：
 
 ```text
-num_levels = 1
+3D/2D projected reference points
+sampling offsets
+attention weights
+GridSample coordinate
+HTP-friendly layout
 ```
 
-底层 helper 也只读取 `spatial_shapes[0]`。
-
-### 所以 UniAD 要补的真正代码
-
-不是重新发明 attention，而是把 Qualcomm single-level core 扩成：
+但是其底层公开 helper：
 
 ```text
-for each fixed level:
-    slice value_l
-    reshape [B*head,C,H_l,W_l]
+custom_multi_scale_deformable_attn_pytorch_single_grid()
+```
+
+实际按：
+
+```text
+value_spatial_shapes[0]
+```
+
+处理 single feature level。
+
+所以这份代码**不能直接作为 UniAD 4-level core 的最终实现**。
+
+---
+
+# 8. 4-level core 应该直接看 Qualcomm Mask2Former
+
+这轮补充后，这个参考比之前更明确。
+
+文件：
+
+```text
+src/qai_hub_models/models/mask2former/model_patches.py
+```
+
+核心函数：
+
+```text
+multi_scale_deformable_attention()
+```
+
+Qualcomm 的结构：
+
+```text
+value
+   ↓
+split([H0*W0, H1*W1, H2*W2, H3*W3])
+   ↓
+level 0 reshape → grid_sample ─┐
+level 1 reshape → grid_sample ─┤
+level 2 reshape → grid_sample ─┤→ concat
+level 3 reshape → grid_sample ─┘
+                                │
+attention_weights ──────────────┤
+                                ↓
+                            weighted sum
+```
+
+这是标准 multi-level deformable attention 最干净的 Qualcomm NPU-oriented 参考之一。
+
+同时还可以看 RF-DETR：
+
+```text
+MSDeformAttn
+ms_deform_attn_core_pytorch
+```
+
+RF-DETR 又提供了：
+
+```text
+multi-level + export shape handling
+```
+
+的另一份证据。
+
+---
+
+# 9. UniAD SCA 建议真正写的新 core
+
+不要直接叫：
+
+```text
+copy_of_qualcomm_bevformer.py
+```
+
+更合理的是做自己的最小部署类：
+
+```text
+MSDeformableAttention3D4LevelQnn
+```
+
+职责明确：
+
+```text
+Input:
+query
+value_l0/l1/l2/l3 或 flattened value
+reference_points
+mask
+
+Static config:
+H0,W0
+H1,W1
+H2,W2
+H3,W3
+num_heads=8
+num_points=8
+
+Graph:
+sampling_offsets
+attention_weights
+for four fixed levels:
     build grid_l
-    grid_sample
-
-concat/stack all levels
-× attention_weights
-sum(level * point)
+    grid_sample(value_l)
+concat
+weighted sum
 ```
 
-这里 level 数固定为 4，完全可以做静态展开，不需要运行时 Python loop。
+注意这里“for four levels”在部署代码里应尽量静态展开，不让运行时 tensor 决定 loop 次数。
 
-### 第二个参考：RF-DETR
-
-Qualcomm RF-DETR 使用的 `ms_deform_attn_core_pytorch` 本身有多 level sampling 逻辑，而且 RF-DETR recipe 已支持 QNN DLC/Context Binary。
-
-因此对 UniAD 4-level SCA，最值得做的是：
+实现来源：
 
 ```text
-BEVFormer Qualcomm：参考 3D reference point/layout/SCA 接口
+BEVFormer SCA class
 +
-RF-DETR Qualcomm：参考 multi-level sampling decomposition
+Mask2Former multi-level core
++
+RF-DETR export shape handling
 ```
 
-把两者组合，而不是只抄一个文件。
+这才是 Qualcomm 代码真正对 UniAD 的组合利用方式。
 
-## 7. Detection Decoder：比 SCA 更接近可直接搬
+---
 
-UniAD detection decoder：
+# 10. Detection Decoder：第二个优先 standalone 的模块
+
+UniAD decoder：
 
 ```text
 MultiheadAttention
@@ -260,42 +612,73 @@ MultiheadAttention
 CustomMSDeformableAttention(num_levels=1)
 ```
 
-Qualcomm BEVFormer patch 已有对应：
+Qualcomm BEVFormer：
 
 ```text
 MultiheadAttention_Optimized
++
 CustomMSDeformableAttention_Decoder_Optimized
 ```
 
-而且 Qualcomm 部署配置同样把 decoder deformable attention 设为 single-level。
+这是目前最接近 source-level 替换的模块之一。
 
-所以这块优先级很高：如果权重/shape contract 对得上，可以先尝试源码层替换，再做 PyTorch 数值对齐。
-
-## 8. Segmentation Head：不要拿 single-level BEVFormer core 硬套
-
-UniAD Pansegformer 的 encoder/decoder 使用：
+第一阶段要检查：
 
 ```text
-MultiScaleDeformableAttention(num_levels=4)
+query layout
+reference_points layout
+sampling_offsets weight shape
+attention_weights weight shape
+value_proj/output_proj weight shape
+batch_first
+residual location
 ```
 
-这一块更适合参考 RF-DETR 的 multi-level deformable attention export core。
-
-需要额外核对：
+如果 parameter shape 一致，优先写一个 weight mapping test：
 
 ```text
-reference_points shape
-num_points
-value layout
-attention weight layout
+load same weights
+Original decoder attention
+vs
+Optimized decoder attention
+```
+
+数值过了再导 QNN。
+
+---
+
+# 11. Panseg / segmentation：也有 4-level，不要复用 single-level helper
+
+Segmentation head 里的 multi-scale attention 应直接进入：
+
+```text
+Mask2Former/RF-DETR multi-level reference
+```
+
+而不是：
+
+```text
+BEVFormer single-level helper
+```
+
+需要独立检查：
+
+```text
+reference_points 2D/4D
+n_levels
+n_points
+value flatten order
+level_start_index
 output projection
 ```
 
-思想可复用，不代表 class API 可直接替换。
+如果和 Mask2Former 的 pixel decoder MSDA 足够接近，这可能比 SCA 更容易先跑通，因为没有 camera rebatch 那层动态逻辑。
 
-## 9. MotionDeformableAttention
+---
 
-UniAD MotionHead 配置：
+# 12. MotionDeformableAttention：sampling core 可复用，motion semantics 不能抄
+
+UniAD Motion：
 
 ```text
 num_levels = 1
@@ -304,205 +687,466 @@ num_points = 4
 num_steps = 12
 ```
 
-源码同样依赖 `MultiScaleDeformableAttnFunction_fp32`，但它额外把未来 trajectory steps 编进 sampling offsets / attention weights，并有 `reference_trajs`、bbox 等运动语义。
-
-因此可复用：
+可以复用的底层：
 
 ```text
-single-level value projection
-sampling location normalization
-grid_sample
-weighted sum
+single-level feature sample
+reference + offset normalization
+GridSample
+attention weighted sum
 ```
 
-不可直接照搬：
+不能直接复制的：
 
 ```text
-sampling_offsets/weights 的 num_steps 维
-reference trajectory 构造
-多 step output fusion
+num_steps 维度的 offset/weight layout
+reference_trajs
+bbox / trajectory semantic transform
+future-step fusion
 ```
 
-建议在 SCA/TSA core 跑通后第三个做它。
+所以 motion 应在 TSA/SCA core 跑通后做，而不是第一批。
 
-## 10. Planning Head：明确划 QNN / CPU 边界
+---
 
-Planning 主干本身包含：
+# 13. Linear / MHA：重点是 layout，不是“Linear 不支持”
+
+Qualcomm BEVFormer：
 
 ```text
-Embedding
-Linear/LayerNorm/ReLU
-TransformerDecoder
-Conv adapter
-cumsum
+OptimizedLinear
 ```
 
-这些可以继续研究 QNN export。
-
-但 `use_col_optim=True` 的测试后处理明确包含：
+实际：
 
 ```text
-torch.nonzero(occupancy)
-动态筛选
-.cpu().detach().numpy()
-CollisionNonlinearOptimizer
-外部非线性求解
-numpy → torch
+Linear on spatial locations
+→ Conv2d(kernel=1)
 ```
 
-这一段不要尝试塞进 DLC。
-
-建议产品边界：
+价值在于：
 
 ```text
-QNN DLC 输出 raw planning trajectory + occupancy
-        ↓
-CPU
-collision nonlinear optimization
-        ↓
-最终轨迹
+保持 NCHW/NHWC 规则 4D tensor
+减少 sequence ↔ spatial layout 反复变换
+更容易让 backend 使用成熟 Conv path
 ```
 
-先把 QNN graph 和 CPU 后处理边界画清楚，比强行“全模型一个 DLC”更现实。
-
-## 11. Query Interaction / Memory Bank：整模型静态化的大风险
-
-UniAD tracking 不是单帧纯前馈模型。它有 track query、query interaction、memory bank、score threshold 等状态逻辑。
-
-对 QNN 来说建议优先设计：
+UniAD 建议先只在：
 
 ```text
-固定容量 query slots
-+
-valid mask
-+
-host 侧状态管理
+TSA/SCA offset projection
+attention weight projection
+规则 BEV spatial FFN
 ```
 
-而不是让 graph 输出/输入不定长 query list。
+试。
 
-因此第一版 DLC 最好明确哪些 state tensor 是 graph I/O：
+不要全局机械替换所有 Linear。
+
+---
+
+# 14. BEV rotate / warp：Qualcomm BEVFormer 可以直接当表达参考
+
+原始业务：
 
 ```text
 prev_bev
-track query features
-track reference points
++
+ego rotation / shift
+→ aligned prev_bev
+```
+
+Deploy graph 可以：
+
+```text
+construct affine/grid
+→ F.grid_sample(prev_bev, grid)
+```
+
+必须对齐：
+
+```text
+center
+角度正负
+radian/degree
+nearest/bilinear
+align_corners
+coordinate convention
+```
+
+这一部分不需要自己从零发明。
+
+---
+
+# 15. ScatterND：Qualcomm 有代码，但 dynamic index 仍然是风险
+
+参考：
+
+```text
+BEVFormer custom_utils.ScatterND
+BEVDet model_patches.py
+```
+
+BEVDet 还明确处理：
+
+```text
+ONNX ScatterND/GatherND index 用 int64
+```
+
+所以：
+
+```text
+ScatterND 本身
+```
+
+并不是“没有任何 Qualcomm 先例”。
+
+真正要审的是：
+
+```text
+indices.shape 是否静态
+indices 内容是否 data-dependent
+重复 index 是 assign 还是 add
+canvas size 是否 compile-time fixed
+```
+
+SCA 的问题仍然主要在 variable visible query 数。
+
+---
+
+# 16. NonZero：不要问 QNN 有没有这个 op，先问它有没有改变图形状
+
+危险逻辑：
+
+```python
+idx = mask.nonzero()
+x = x[idx]
+max_len = idx.shape[0]
+y = torch.zeros(max_len, ...)
+```
+
+这是：
+
+```text
+data
+→ control/shape
+```
+
+第一版应该改成：
+
+```text
+fixed capacity
++ mask
+```
+
+Qualcomm 其它模型（例如 StateTransformer）也会专门改掉“nonzero 结果决定后续执行哪些分支/专家”的 data-dependent control flow。
+
+这个经验和 SCA/track queries 完全同类。
+
+---
+
+# 17. Tracking / Memory Bank：这是模型接口问题，不只是算子问题
+
+UniAD 跨帧有：
+
+```text
+track query
+memory bank
+prev_bev
+score/valid state
+```
+
+即使每个单独 operator 都能 export，整模型仍然可能因为 state 数量动态而无法静态部署。
+
+第一版应该设计：
+
+```text
+fixed N track slots
+feature tensor
+reference tensor
 valid mask
-memory state
+memory tensor
 ```
 
-这属于模型接口设计，不只是 op support。
-
-## 12. `OptimizedLinear` 可以在哪些地方借鉴
-
-Qualcomm BEVFormer 把规则空间 tensor 上的 Linear 映射成 1x1 Conv2d。
-
-UniAD 里最值得考虑的场景：
+CPU/runtime 决定：
 
 ```text
-BEV [B,H,W,C]
-image feature [B,C,H,W]
-attention offset/weight projection
-FFN 中保持空间 layout 的 projection
+哪些 slot 有效
+跨帧怎么更新 state
 ```
 
-不建议一上来全局替换所有 `nn.Linear`；先针对 BEV/SCA/TSA 做。
+而不是让 QNN graph I/O rank/length 每帧变化。
 
-## 13. Rotate / geometry 可以直接参考 BEVFormer
+这部分要作为“deployment interface design”单独立项。
 
-UniAD 的 BEV encoder 继承了 BEVFormer 的：
+---
+
+# 18. Planning：把神经网络和 nonlinear optimizer 分开
+
+Planning neural graph 可以继续研究：
 
 ```text
-rotate_prev_bev
-use_shift
-can_bus
-reference point projection
-lidar2img
-bev_mask
+Embedding
+Linear
+LayerNorm
+Transformer decoder
+Conv/MLP
+cumsum
 ```
 
-Qualcomm BEVFormer 已经为 export 做了大量改写，包括 `grid_sample` rotate、固定输入 `can_bus/lidar2img`、SCA mask/query 处理。
-
-这一部分是目前最直接的上游参考，优先从 Qualcomm BEVFormer patch 对照 UniAD，而不是从零改 UniAD。
-
-## 14. 第一阶段不要导整个 UniAD，建议这个顺序
-
-### Experiment 1：TSA
+但 collision optimization 里：
 
 ```text
-TemporalSelfAttention(level=1)
+nonzero occupancy
+动态筛选
+.cpu()
+.numpy()
+CollisionNonlinearOptimizer
+numpy → torch
 ```
 
-目标：验证 Qualcomm TSA optimized 路线能否直接映射 UniAD 权重。
-
-### Experiment 2：Decoder MSDA
+第一版明确：
 
 ```text
-CustomMSDeformableAttention(level=1)
+QNN DLC
+    ↓
+raw planning trajectory + occupancy
+    ↓
+ARM CPU
+    ↓
+collision nonlinear optimizer
+    ↓
+final trajectory
 ```
 
-目标：验证 decoder optimized 路线。
+这不是妥协，而是正确的软件边界。
 
-### Experiment 3：4-level deformable core
+---
+
+# 19. 现在应该从 Qualcomm 仓库拉哪些文件
+
+建议建立一个只读 reference 目录或记录 commit，不直接把整个仓库抄进项目。
+
+## Attention / BEV
 
 ```text
-只做 MSDeformableAttention3D core
-levels=4
+src/qai_hub_models/models/bevformer/
+  model.py
+  external_repos/bevformertiny_minimal.diff
 ```
 
-组合 BEVFormer + RF-DETR 的 Qualcomm 参考。
-
-### Experiment 4：SpatialCrossAttention
-
-加上：
+重点恢复：
 
 ```text
-camera rebatch
-mask
-scatter/camera aggregation
+deformable_attention.py
+MultiheadAttention.py
+custom_utils.py
+SpatialCrossAttention patch
+TemporalSelfAttention patch
 ```
 
-### Experiment 5：BEV encoder
+本项目已有抽取工具：
 
-```text
-TSA + SCA + FFN x 1 layer
-→ x 6 layers
+```bash
+python scripts/extract-qualcomm-bevformer-patch-files.py ...
 ```
 
-### Experiment 6：Backbone/neck
-
-单独处理 DCNv2，再与 BEV encoder 拼接。
-
-### Experiment 7：Detection decoder
-
-### Experiment 8：Motion / Occ / Planning neural part
-
-碰到 CPU solver、动态 tracking state 时主动划 graph boundary。
-
-## 15. Qualcomm 源码参考入口
-
-`qualcomm/ai-hub-models`：
+## 4-level MSDA
 
 ```text
-src/qai_hub_models/models/bevformer/model.py
-src/qai_hub_models/models/bevformer/external_repos/bevformertiny_minimal.diff
+src/qai_hub_models/models/mask2former/model_patches.py
 src/qai_hub_models/models/rf_detr/model.py
 ```
 
-BEVFormer patch 应重点抽出：
+外加 RF-DETR 上游：
 
 ```text
-projects/mmdet3d_plugin/bevformer/modules/deformable_attention.py
-projects/mmdet3d_plugin/bevformer/modules/MultiheadAttention.py
-projects/mmdet3d_plugin/custom_utils.py
-projects/mmdet3d_plugin/bevformer/modules/spatial_cross_attention.py 的 patch
-projects/mmdet3d_plugin/bevformer/modules/temporal_self_attention.py 的 patch
+rfdetr/models/ops/modules/ms_deform_attn.py
+rfdetr/models/ops/functions/ms_deform_attn_func.py
 ```
 
-仓库里的 `scripts/extract-qualcomm-bevformer-patch-files.py` 用于从 Qualcomm 官方 patch 重建其中“新增文件”，避免手工复制第三方 800+ 行源码。
+## DCNv2
 
-## 16. 当前最值得先验证的三个结论
+```text
+src/qai_hub_models/models/templates/centernet/model_patches.py
+```
 
-1. **UniAD TSA 是 single-level，和 Qualcomm TSA optimized 最接近。** 这是最适合第一个做 standalone DLC 的 attention。
-2. **UniAD SCA 是 4-level，而 Qualcomm BEVFormer QNN 版本是 1-level。** 不能直接替换，但可以用 Qualcomm BEVFormer 的 SCA/layout + RF-DETR 的 multi-level sampling 拼出部署版。
-3. **完整 UniAD 不应该先追求“所有逻辑都进一个 DLC”。** Collision optimizer、动态 track state 等天然适合留在 CPU；先定义稳定的 QNN graph I/O 边界。
+这是下一阶段应该直接读代码的文件，不再只记一个“DCN 高风险”标签。
+
+## Scatter / BEV geometry
+
+```text
+src/qai_hub_models/models/bevdet/model_patches.py
+src/qai_hub_models/models/simple_bev_cam/
+```
+
+---
+
+# 20. 实际实验顺序现在改成这样
+
+## Experiment 0：GridSample primitive
+
+```text
+small static feature
++ fixed grid
+→ GridSample
+→ QNN DLC / HTP
+```
+
+先确认目标 SDK/device 的最基本 sampling contract。
+
+## Experiment 1：DCNv2 decomposition
+
+```text
+真实 UniAD DCNv2 layer + weight
+Original mmcv
+vs
+Qualcomm-style custom_deformconv2d
+```
+
+## Experiment 2：TSA single-level
+
+```text
+Original UniAD TSA
+vs
+Qualcomm-style TSA optimized
+→ QNN DLC
+```
+
+## Experiment 3：Decoder single-level MSDA
+
+```text
+Original decoder attention
+vs
+Qualcomm optimized decoder attention
+```
+
+## Experiment 4：4-level MSDA core
+
+```text
+Mask2Former/RF-DETR style per-level GridSample
+```
+
+先不加 camera rebatch。
+
+## Experiment 5：SCA static rebatch/scatter
+
+```text
+fixed K per camera
++ mask
++ 4-level core
++ ScatterND
+```
+
+## Experiment 6：一层 BEV encoder
+
+```text
+TSA
+→ Norm
+→ SCA
+→ Norm
+→ FFN
+```
+
+## Experiment 7：6-layer BEV encoder + prev_bev
+
+最后才扩大。
+
+这比直接 export stage2_e2e 更容易产生真正可复用结论。
+
+---
+
+# 21. 每个实验必须输出一张算子证据卡
+
+示例：
+
+```text
+Module:
+UniAD DCNv2 stage3 blockX
+
+Original:
+mmcv ModulatedDeformConv2d
+
+Deploy implementation:
+CenterNet-style custom_deformconv2d
+
+Static contract:
+input      [1,C,H,W] fp32
+kernel     3x3
+offset     ...
+mask       ...
+
+Numeric:
+Original vs Patched max_abs = ...
+
+Export:
+PASS / FAIL
+
+QNN DLC:
+PASS / FAIL
+
+HTP Finalize:
+PASS / FAIL
+
+HTP Execute:
+PASS / FAIL
+
+Latency:
+API wall = ...
+accelerator = ...
+
+Limitation:
+...
+```
+
+最后形成的是：
+
+```text
+UniAD-on-QNN operator notebook
+```
+
+而不是一份没有实验证据的“支持列表”。
+
+---
+
+# 22. 当前最值得马上做的两件代码工作
+
+如果接下来开始写代码，而不是继续看文档，我建议：
+
+```text
+Task A
+从 Qualcomm CenterNet `custom_deformconv2d` 做一个 UniAD DCNv2 adapter
+→ 用真实 UniAD DCN weight 做 eager 数值对齐
+
+Task B
+写 `MSDeformableAttention3D4LevelQnn`
+→ SCA interface 参考 BEVFormer
+→ multi-level core 参考 Mask2Former/RF-DETR
+→ 暂时不加 camera dynamic rebatch
+```
+
+这两个都是明确的工程实验，不再是“研究一下算子支持”。
+
+---
+
+## 参考源码
+
+Qualcomm AI Hub Models：
+
+```text
+src/qai_hub_models/models/bevformer/external_repos/bevformertiny_minimal.diff
+src/qai_hub_models/models/mask2former/model_patches.py
+src/qai_hub_models/models/templates/centernet/model_patches.py
+src/qai_hub_models/models/bevdet/model_patches.py
+src/qai_hub_models/models/simple_bev_cam/
+src/qai_hub_models/models/rf_detr/model.py
+```
+
+本仓库：
+
+```text
+docs/qnn-operator-support.md
+docs/qnn-model-porting.md
+scripts/extract-qualcomm-bevformer-patch-files.py
+```
